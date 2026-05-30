@@ -1,0 +1,12 @@
+{
+  "name": "p2pvoice-signaling",
+  "version": "1.1.0",
+  "description": "WebSocket signaling server for P2P Voice Android app, with optional FCM push",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "firebase-admin": "^12.6.0"
+  }
+}
