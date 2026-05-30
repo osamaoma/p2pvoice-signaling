@@ -67,6 +67,10 @@ const users = new Map();
 const fcmTokens = new Map();
 // callId -> { caller, callee, peers:Set }
 const calls = new Map();
+// username -> array of pending chat messages {id, from, ciphertext, ts}
+// Held while the recipient is offline; flushed on their next register.
+const pendingMessages = new Map();
+const MAX_QUEUE_PER_USER = 200;
 
 function send(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -120,6 +124,44 @@ async function pushIncomingCall(toUsername, fromUsername, callId) {
   }
 }
 
+// Send an FCM data message to wake the recipient app for a new chat message.
+// Unlike calls, we use normal priority and a 24h TTL so chats survive longer
+// periods of the recipient being offline.
+async function pushChatMessage(toUsername, fromUsername, count) {
+  if (!fcm) return;
+  const entry = fcmTokens.get(toUsername);
+  if (!entry || !entry.token) return;
+  const msg = {
+    token: entry.token,
+    data: {
+      type: 'chat',
+      from: fromUsername,
+      count: String(count || 1),
+    },
+    android: {
+      priority: 'high',
+      ttl: 24 * 60 * 60 * 1000,
+    },
+  };
+  try {
+    await fcm.send(msg);
+  } catch (err) {
+    if (err.code === 'messaging/registration-token-not-registered'
+        || err.code === 'messaging/invalid-registration-token') {
+      fcmTokens.delete(toUsername);
+    }
+  }
+}
+
+// Send any messages queued for a user that just came online.
+function flushPending(username, ws) {
+  const queue = pendingMessages.get(username);
+  if (!queue || queue.length === 0) return;
+  for (const m of queue) send(ws, m);
+  pendingMessages.delete(username);
+  console.log(`flushed ${queue.length} queued message(s) to ${username}`);
+}
+
 wss.on('connection', (ws) => {
   ws.username = null;
   ws.isAlive = true;
@@ -148,6 +190,8 @@ wss.on('connection', (ws) => {
         users.set(name, ws);
         send(ws, { type: 'registered', username: name });
         console.log(`registered: ${name} (online=${users.size})`);
+        // Deliver anything we queued while they were away.
+        flushPending(name, ws);
         break;
       }
 
@@ -158,6 +202,42 @@ wss.on('connection', (ws) => {
         if (!token) return;
         fcmTokens.set(ws.username, { token, updated: Date.now() });
         console.log(`fcm token registered for ${ws.username}`);
+        break;
+      }
+
+      // --- Chat: encrypted text message from sender to recipient ---
+      //   in:  { type:'chat_send', to, id, ciphertext }
+      //   out: { type:'chat_msg', from, id, ciphertext, ts }   to recipient
+      //        { type:'chat_ack', id, status:'sent'|'queued' } to sender
+      case 'chat_send': {
+        if (!ws.username) return;
+        const to = (msg.to || '').trim().toLowerCase();
+        const id = (msg.id || '').trim();
+        const ciphertext = msg.ciphertext;
+        if (!to || !id || !ciphertext) return;
+
+        const envelope = {
+          type: 'chat_msg',
+          from: ws.username,
+          id,
+          ciphertext,
+          ts: Date.now(),
+        };
+        const recipientWs = users.get(to);
+        if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+          send(recipientWs, envelope);
+          send(ws, { type: 'chat_ack', id, status: 'sent' });
+          console.log(`chat ${ws.username} -> ${to} (delivered)`);
+        } else {
+          // Queue for later, and try to wake via FCM.
+          let q = pendingMessages.get(to);
+          if (!q) { q = []; pendingMessages.set(to, q); }
+          q.push(envelope);
+          if (q.length > MAX_QUEUE_PER_USER) q.shift(); // drop oldest
+          send(ws, { type: 'chat_ack', id, status: 'queued' });
+          pushChatMessage(to, ws.username, q.length);
+          console.log(`chat ${ws.username} -> ${to} (queued, ${q.length} pending)`);
+        }
         break;
       }
 
