@@ -65,6 +65,8 @@ const wss = new WebSocket.Server({ server: httpServer });
 const users = new Map();
 // username -> { token, updated }  (FCM device token for push wakeup)
 const fcmTokens = new Map();
+// username -> publicKey (base64 X25519 public key, set on registration)
+const pubKeys = new Map();
 // callId -> { caller, callee, peers:Set }
 const calls = new Map();
 // username -> array of pending chat messages {id, from, ciphertext, ts}
@@ -202,6 +204,29 @@ wss.on('connection', (ws) => {
         if (!token) return;
         fcmTokens.set(ws.username, { token, updated: Date.now() });
         console.log(`fcm token registered for ${ws.username}`);
+        break;
+      }
+
+      // --- E2EE: client uploads its long-term X25519 public key ---
+      //     in:  { type:'pubkey_upload', publicKey:'<b64>' }
+      case 'pubkey_upload': {
+        if (!ws.username) return;
+        const pk = (msg.publicKey || '').trim();
+        if (!pk) return;
+        pubKeys.set(ws.username, pk);
+        console.log(`pubkey stored for ${ws.username}`);
+        break;
+      }
+
+      // --- E2EE: client asks for a peer's public key ---
+      //     in:  { type:'pubkey_request', peer:'<username>' }
+      //     out: { type:'pubkey_response', peer:'<username>', publicKey:'<b64>'|null }
+      case 'pubkey_request': {
+        if (!ws.username) return;
+        const peer = (msg.peer || '').trim().toLowerCase();
+        if (!peer) return;
+        const pk = pubKeys.get(peer) || null;
+        send(ws, { type: 'pubkey_response', peer, publicKey: pk });
         break;
       }
 
